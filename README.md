@@ -1,9 +1,18 @@
-# 交换机出口 告警/相机图像 重放试算 API
+# 交换机出口 告警/相机图像 重放试算 + 校时生效时刻试算 API
 
-产线告警与相机图像共用同一台交换机出口。本服务用离散事件仿真重放一段时间内的帧发送过程，
-供网管在**改配前试算**：调整周期与告警预留时长后，哪些告警会超时。
+两类网管试算能力：
 
-所有时间均为**整数毫秒**，时间轴从 `0` 开始，仿真区间为半开区间 `[0, replay_end_ms)`。
+1. **重放试算**：产线告警与相机图像共用交换机出口，离散事件仿真一段时间内的帧发送过程，
+   供网管在改配前看哪些告警会超时。
+2. **校时试算**：两台串联交换机要在检修窗口切换告警预留配置，网管按四时刻校时探测推算各设备
+   时钟相对控制器的偏移，试算出一对可下发的**本地整数毫秒生效时刻**，保证无论偏移取哪种可能
+   组合，两台设备都在控制器时钟的改配窗口内生效、且生效时差不超限。
+
+所有时间均为**整数毫秒**。
+
+# 一、重放试算
+
+时间轴从 `0` 开始，仿真区间为半开区间 `[0, replay_end_ms)`。
 
 ## 调度规则
 
@@ -30,30 +39,7 @@
 | `queued` | 已到达但排队未发 |
 | `not_arrived` | 到达时刻不早于重放终点，未进入仿真 |
 
-## 运行
-
-### Docker Compose（推荐交付方式）
-
-```bash
-docker compose up --build
-# 打开浏览器
-#   http://localhost:8000/docs
-```
-
-`/docs` 内置两个可直接 “Try it out” 的示例（含换配 / 不换配）。
-
-### 本地（无 Docker 时）
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-## 接口
-
-### `POST /replay`
+## `POST /replay`
 
 请求字段：
 
@@ -68,68 +54,178 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 响应返回：`switch`（计划/实际切换时刻与 `switched`/`not_switched`/`not_requested` 状态）、
 终点时刻实际生效的周期与预留、逐帧发送起止与终点状态、告警计时与超时标记、汇总统计。
 
-另有 `GET /health` 健康检查。
+# 二、校时生效时刻试算
+
+## 时钟模型与偏移推算
+
+约定偏移 `o`（整数，可为负）：
+
+```
+设备本地时刻 = 控制器时刻 + o
+```
+
+每条探测上报四个整数毫秒时刻：`t1` 控制器发出、`t2` 设备接收、`t3` 设备发回、`t4` 控制器收到。
+设正向（控制器→设备）、反向（设备→控制器）传输耗时分别为 `d_up, d_down >= 0`：
+
+```
+t2 = t1 + d_up + o   ⇒   o <= t2 - t1
+t4 = t3 + d_down - o ⇒   o >= t3 - t4
+```
+
+即一条探测给出偏移闭区间 `[t3-t4, t2-t1]`。同一轮次内设备相对同一控制器的偏移固定，
+多条探测的区间取**交集** `[max(t3-t4), min(t2-t1)]`；交集为空即探测矛盾（含单条探测
+`t3-t4 > t2-t1`，意味着两向时延不可能同时非负）。
+
+## 轮次登记语义
+
+- 探测按“设备 + 递增校时轮次”分批上报，轮次必须**严格大于**该设备当前轮次。
+- 登记新轮次立即**停用旧轮次的全部证据**（旧证据删除，不再参与试算）。
+- 新轮次可**空报**（`probes=[]`）：只登记轮次并停用旧证据。
+- 已停用的旧轮次若迟来补报，一律**拒收（HTTP 409）**，登记库与落盘文件均不变。
+- 每次提交成功后原子写盘（临时文件 + `os.replace`），**服务重启后仍用已登记的轮次和证据试算**。
+
+## 试算求解（最坏情形保证）
+
+请求给出两台设备、控制器时钟上的改配窗口 `[W0, W1]`（**含两端**）与允许的最大生效时差 `D`（含等号）。
+试算在**同一已提交时点**取两台设备各自当前轮次的全部探测，分别得到偏移区间 `[L_i, U_i]`。
+
+对设备 i 下发本地时刻 `x_i`，其实际生效时刻（控制器时钟）为 `T_i = x_i - o_i`。要求对偏移区间内
+**任意整数组合**同时成立：
+
+1. `W0 <= T_i <= W1`（两台各自落窗，含两端）；
+2. `|T_1 - T_2| <= D`。
+
+推导（全程整数运算）：
+
+- 落窗 ⇔ `x_i - U_i >= W0` 且 `x_i - L_i <= W1`，即本地时刻可行域
+  `x_i ∈ [W0 + U_i, W1 + L_i]`；该域为空说明窗口窄于偏移不确定宽度，无解。
+- 时差：令 `Δx = x_2 - x_1`，则 `T_1-T_2 = -Δx + (o_2-o_1)`，而两独立偏移之差
+  `o_2-o_1` 的取值范围为 `[L_2-U_1, U_2-L_1]`。整个时差区间落入 `[-D, D]` 等价于
+  `Δx ∈ [(U_2-L_1)-D, (L_2-U_1)+D]`。
+- 再与两台本地时刻可行域联立（整数区间相交，O(1)，不随窗口宽度扫描）；
+  找到解时返回一对本地时刻、各自在控制器时钟上的生效浮动范围 `[x-U, x-L]`、
+  所用轮次与最坏时差，求解结果确定可复现（取最小可行 `x_1` 与最小可行 `Δx`）。
+
+缺探测、探测矛盾或无解时 HTTP 仍为 200，`feasible=false` 并在 `reason`/`message` 说明：
+
+| reason | 含义 |
+|---|---|
+| `missing_probes` | 至少一台设备当前轮次没有任何探测 |
+| `contradictory_probes` | 探测自身矛盾或区间交集为空，偏移不存在 |
+| `no_solution` | 偏移可推算，但窗口/时差约束下无整数可行解 |
+
+## 接口
+
+| 方法/路径 | 说明 |
+|---|---|
+| `POST /timing/probes` | 按设备+轮次上报一批探测；空报仅登记轮次；旧轮次迟报 409 |
+| `GET /timing/devices` | 全部设备的当前轮次、在册探测数、偏移区间与矛盾说明 |
+| `GET /timing/devices/{device_id}` | 单台设备状态；未登记 404 |
+| `POST /timing/trial` | 两台设备的生效时刻试算；设备未登记 404，请求体非法 422 |
 
 ### 请求示例
 
+上报探测（两向时延不同的两条探测，偏移区间取交）：
+
 ```json
 {
-  "period_ms": 100,
-  "reserve_ms": 40,
-  "alarm_deadline_ms": 80,
-  "replay_end_ms": 320,
-  "frames": [
-    {"id": "A1", "type": "alarm", "arrival_ms": 0,   "busy_ms": 30},
-    {"id": "A2", "type": "alarm", "arrival_ms": 5,   "busy_ms": 60},
-    {"id": "I1", "type": "image", "arrival_ms": 10,  "busy_ms": 50},
-    {"id": "A3", "type": "alarm", "arrival_ms": 120, "busy_ms": 25},
-    {"id": "I2", "type": "image", "arrival_ms": 130, "busy_ms": 70}
-  ],
-  "switch_at_ms": 150,
-  "new_period_ms": 120,
-  "new_reserve_ms": 60
+  "device_id": "SW-A",
+  "round": 0,
+  "probes": [
+    {"t1_controller_send_ms": 0,    "t2_device_receive_ms": 15,
+     "t3_device_send_ms": 25,       "t4_controller_receive_ms": 40},
+    {"t1_controller_send_ms": 100,  "t2_device_receive_ms": 145,
+     "t3_device_send_ms": 160,      "t4_controller_receive_ms": 165}
+  ]
 }
 ```
 
-## 目录结构
+试算：
+
+```json
+{
+  "device_ids": ["SW-A", "SW-B"],
+  "window_start_ms": 10000,
+  "window_end_ms": 10200,
+  "max_effective_skew_ms": 60
+}
+```
+
+# 三、运行
+
+## Docker Compose（推荐交付方式）
+
+```bash
+docker compose up --build
+# 打开浏览器
+#   http://localhost:8000/docs
+```
+
+校时登记文件落在容器内 `/app/data/timing_store.json` 并挂载到命名卷 `timing-data`，
+容器重启（含 `restart: unless-stopped` 触发的重启）后轮次与证据不丢。
+可用环境变量 `TIMING_STORE_PATH` 覆盖落盘路径。
+
+`/docs` 内置各接口可直接 “Try it out” 的示例。
+
+## 本地（无 Docker 时）
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+# 四、目录结构
 
 ```
 app/
-  main.py      FastAPI 入口（/replay、/health、/docs）
-  models.py    Pydantic 请求/响应模型与交叉字段校验
-  replay.py    离散事件仿真引擎
+  main.py            FastAPI 入口（/replay、/timing/*、/health、/docs）
+  models.py          重放请求/响应模型
+  replay.py          离散事件重放引擎
+  timing_models.py   校时探测/试算的请求响应模型
+  timing_engine.py   偏移推算与试算求解（纯函数，无状态）
+  timing_store.py    轮次/证据登记库：线程安全 + JSON 原子落盘 + 重启恢复
 tests/
-  test_replay.py  18 个自测用例
+  test_replay.py     重放自测（18 个用例）
+  test_timing.py     校时自测（24 个用例，含全偏移组合暴力枚举与 150 组随机交叉验证）
 Dockerfile / docker-compose.yml / requirements.txt
 ```
 
-## 自测
+# 五、自测
 
 ```bash
 pip install pytest httpx
 pytest -q
 ```
 
-覆盖重点：
+校时部分覆盖重点：
 
-- **整帧放不进本类时段**：队首阻塞（后续同类帧不插队）、放不进的帧持续 `queued` 且不影响异类、
-  换配扩大预留后队首先于后续帧发出；
-- **发帧中改配**：换配时刻落在发送区间内时，等帧发完的周期边界才切换、排队帧保留、
-  新周期从生效时刻重对齐；空闲时换配等当前周期结束；恰好落在边界则当刻生效；
-  被推迟到终点之后则 `not_switched`；
-- 告警超时边界（等于时限不超时、严格大于才超时）、`in_progress`/`queued` 计时到终点；
-- `reserve=0`、`reserve=period`、到达时刻等于终点、缺省 id、参数校验 422；
-- 发送区间互不重叠、区间长度等于占线时长等不变量；
-- 大终点（10^7 ms）快速收敛，不随周期数空转。
+- 单条/多条探测的偏移区间、交集；探测自身矛盾与交集为空；
+- **两向传输耗时不同**（非对称时延）下的推算与试算，可行结果对两台设备偏移区间内的
+  **全部整数组合做暴力枚举**复核（落窗 + 时差），并与独立暴力求解器的可行性结论对照；
+- **150 组随机参数**（含负偏移、多探测交集、窄窗口、D=0）下求解器与暴力枚举结论零分歧；
+- 窗口窄于偏移宽度、时差可行区间与落窗可行域无交集（含 D=0 严格同时生效）、缺探测、矛盾等
+  无解路径；
+- 新轮次登记即停用旧证据、**旧轮次迟报拒收**（单元级 + HTTP 409）、拒收不触碰落盘文件；
+- 重启后从 JSON 恢复轮次/证据并继续拒收迟报；
+- 请求校验（设备 id 重复、窗口倒置、负时差限值、轮次非负等）422。
 
-实测（本地 venv，FastAPI 0.165 / Pydantic 2.14 / uvicorn 0.54）：**18 passed**，全量约 1.2s；
-真实 uvicorn 起服务后 `/health`、`/docs`、`/openapi.json` 均 200，非法请求返回 422，
-两个重点场景的 HTTP 响应与手算一致。
+实测（本地 venv，FastAPI 0.165 / Pydantic 2.14 / uvicorn 0.54）：**42 passed**（重放 18 + 校时 24）；
+真实 uvicorn 起服务后 `/health`、`/docs`、`/openapi.json` 均 200，手工试跑：
 
-## 余项 / 约定说明
+- 非对称两向时延：SW-A 两探测推出 `o∈[-5,15]`、SW-B 推出 `o∈[-30,0]`，窗口 `[10000,10200]`、
+  时差限值 60 时下发本地时刻 10015 / 10000，生效浮动范围 `[10000,10020]` 与 `[10000,10030]`，
+  所有偏移组合下最坏时差 30ms；限值收紧到 5 或 0 均返回 `no_solution` 并说明原因；
+- SW-A 轮次 0 迟报返回 409 且证据条数不变；轮次 1 空报后旧证据停用，试算转 `missing_probes`；
+- 杀掉进程后以同一存储路径重启，轮次/证据完整恢复，旧轮次迟报仍 409。
 
-- 本交付环境无 Docker 守护进程，`docker compose build/up` 仅做了 compose YAML 与 Dockerfile 静态核对，
-  未实机构建；在有 Docker 的机器上执行上文命令即可。
+# 六、余项 / 约定说明
+
+- 本交付环境无 Docker 守护进程，`docker compose build/up` 仅做了 compose YAML 与 Dockerfile
+  静态核对，未实机构建；在有 Docker 的机器上执行上文命令即可。
 - “切换只在周期边界生效”是对“到点若有帧在发，等它发完再切换”的一致化推广：
   出口空闲时也等到当前周期结束，避免在时段中间凭空产生新的时段边界。
-- 仿真为纯函数式计算、无外部状态，单请求耗时只与帧数量和事件数相关，与 `replay_end_ms` 大小无关。
+- 重放为纯函数式计算；校时试算的求解部分同样是纯函数，登记状态集中在 `TimingStore`，
+  进程内以可重入锁串行化写操作。多副本部署时共享存储需另行换成数据库/分布式锁，当前不支持。
+- 轮次号只要求严格递增、允许跳跃（如 0 直接到 5）；轮次号语义由网管侧保证，服务不解释其来源。

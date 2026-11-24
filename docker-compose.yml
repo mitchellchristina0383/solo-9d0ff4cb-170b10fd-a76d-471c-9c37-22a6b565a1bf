@@ -1,13 +1,21 @@
 services:
   replay-api:
     build: .
-    image: switch-egress-replay:1.0.0
+    image: switch-egress-replay:1.1.0
     container_name: switch-egress-replay
     ports:
       - "8000:8000"
+    environment:
+      # 校时轮次与探测证据的落盘文件；挂载到命名卷，容器重启后仍可试算
+      TIMING_STORE_PATH: /app/data/timing_store.json
+    volumes:
+      - timing-data:/app/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
       interval: 10s
       timeout: 3s
       retries: 5
+
+volumes:
+  timing-data:
